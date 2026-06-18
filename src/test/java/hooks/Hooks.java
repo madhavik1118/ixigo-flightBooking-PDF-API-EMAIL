@@ -68,8 +68,8 @@ public class Hooks {
 		ExtentReporter.initializeReport();
 		test = ExtentReporter.createTest(scenario.getName());
 		test.info("Starting Scenario " + scenario.getName());
-		String excelPath = System.getProperty("user.dir") + "/src/test/resources/testData/Ixigo.xlsx";
-		ExcelUtil.getSheetData(excelPath, "QA", scenario.getName());
+		/*String excelPath = System.getProperty("user.dir") + "/src/test/resources/testData/Ixigo.xlsx";
+		ExcelUtil.getSheetData(excelPath, "QA", scenario.getName());*/
 		ConfigReader config = new ConfigReader();
 	}
 
