@@ -7,7 +7,10 @@ import java.io.InputStreamReader;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.nio.file.StandardOpenOption;
+import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Set;
 
 import utils.EmailUtil;
 import utils.FailedScenarioTracker;
@@ -27,6 +30,7 @@ public class MasterTestRunner {
 
     private static final String EXTENT_REPORT_PATH = System.getProperty("user.dir") + "/target/ExtentReport.html";
     private static final String RERUN_FILE = "target/failed-scenarios.txt";
+    private static final String ALL_FAILURES_FILE = "target/all-failed-scenarios.txt";
     private static final String PROJECT_DIR = System.getProperty("user.dir");
 
     public static void main(String[] args) {
@@ -34,25 +38,31 @@ public class MasterTestRunner {
         System.out.println("  MASTER TEST RUNNER - Starting Full Execution Lifecycle");
         System.out.println("================================================================");
 
+        // Clear accumulated failures file from any previous run
+        clearFile(ALL_FAILURES_FILE);
+
         // Step 1: Run @ui tagged scenarios (Flight booking tests)
         System.out.println("\n>>> STEP 1: Running @ui tagged scenarios...\n");
         runMavenTests("@ui");
+        accumulateFailures();
 
         // Step 2: Run @api tagged scenarios (API tests)
         System.out.println("\n>>> STEP 2: Running @api tagged scenarios...\n");
         runMavenTests("@api");
+        accumulateFailures();
 
         // Step 3: Run @pdf tagged scenarios (PDF validation tests)
         System.out.println("\n>>> STEP 3: Running @pdf tagged scenarios...\n");
         runMavenTests("@pdf");
+        accumulateFailures();
 
-        // Step 4: Check if failed-scenarios.txt has content (written by Cucumber rerun plugin)
+        // Step 4: Check if any failures were accumulated across all steps
         System.out.println("\n>>> STEP 4: Checking for failed scenarios...\n");
-        boolean hasFailures = isRerunFilePopulated();
+        boolean hasFailures = isFilePopulated(ALL_FAILURES_FILE);
 
-        // Step 5: Re-execute failed tests if rerun file has content
+        // Step 5: Re-execute failed tests if any failures accumulated
         if (hasFailures) {
-            List<String> failedEntries = readRerunFileEntries();
+            List<String> failedEntries = readFileEntries(ALL_FAILURES_FILE);
             System.out.println("\n>>> STEP 5: Re-executing " + failedEntries.size() + " failed scenario(s)...\n");
             for (String entry : failedEntries) {
                 System.out.println("    - " + entry);
@@ -81,6 +91,7 @@ public class MasterTestRunner {
             System.out.println("  Working Dir: " + PROJECT_DIR);
 
             ProcessBuilder pb = new ProcessBuilder("cmd", "/c", "mvn", "test",
+                    "-Dtest=TestRunner",
                     "-Dcucumber.filter.tags=" + tagExpression,
                     "-Dsurefire.useFile=false");
             pb.directory(new File(PROJECT_DIR));
@@ -101,19 +112,19 @@ public class MasterTestRunner {
     }
 
     /**
-     * Re-runs failed scenarios by reading the failed-scenarios.txt file,
+     * Re-runs failed scenarios by reading the accumulated failures file,
      * converting classpath references to file paths, and passing them directly
      * to Cucumber via cucumber.features property with only the cucumber engine enabled.
      */
     private static int runRerunTests() {
         try {
             System.out.println("  Re-running failed scenarios using Cucumber engine directly...");
-            System.out.println("  Rerun file: " + RERUN_FILE);
+            System.out.println("  Failures file: " + ALL_FAILURES_FILE);
 
-            // Read the rerun file and convert classpath: references to actual file paths
-            String featuresArg = buildFeaturesArgFromRerunFile();
+            // Read the accumulated failures file and convert classpath: references to file paths
+            String featuresArg = buildFeaturesArgFromFile(ALL_FAILURES_FILE);
             if (featuresArg == null || featuresArg.isEmpty()) {
-                System.out.println("  No valid feature references found in rerun file. Skipping.");
+                System.out.println("  No valid feature references found. Skipping.");
                 return 0;
             }
             System.out.println("  Features arg: " + featuresArg);
@@ -142,58 +153,115 @@ public class MasterTestRunner {
     }
 
     /**
-     * Reads the failed-scenarios.txt and converts entries like
-     * "classpath:features/BookAirTicket.feature:7" to absolute file paths like
-     * "src/test/resources/features/BookAirTicket.feature:7"
+     * After each step, reads failed-scenarios.txt (written by Cucumber rerun plugin)
+     * and appends unique entries to the accumulated all-failed-scenarios.txt file.
      */
-    private static String buildFeaturesArgFromRerunFile() {
+    private static void accumulateFailures() {
         try {
             Path rerunPath = Paths.get(RERUN_FILE);
-            if (!Files.exists(rerunPath)) return null;
+            Path allFailuresPath = Paths.get(ALL_FAILURES_FILE);
+
+            if (!Files.exists(rerunPath)) return;
 
             String content = Files.readString(rerunPath).trim();
+            if (content.isEmpty()) return;
+
+            // Read existing accumulated entries to avoid duplicates
+            Set<String> existingEntries = new LinkedHashSet<>();
+            if (Files.exists(allFailuresPath)) {
+                List<String> existing = Files.readAllLines(allFailuresPath);
+                existing.forEach(line -> {
+                    if (!line.isBlank()) existingEntries.add(line.trim());
+                });
+            }
+
+            // Parse new failures (could be space-separated or newline-separated)
+            String[] newEntries = content.split("[\\s]+");
+            StringBuilder toAppend = new StringBuilder();
+            for (String entry : newEntries) {
+                entry = entry.trim();
+                if (!entry.isEmpty() && !existingEntries.contains(entry)) {
+                    existingEntries.add(entry);
+                    toAppend.append(entry).append(System.lineSeparator());
+                }
+            }
+
+            if (toAppend.length() > 0) {
+                Files.writeString(allFailuresPath, toAppend.toString(),
+                        StandardOpenOption.CREATE, StandardOpenOption.APPEND);
+                System.out.println("  Accumulated " + newEntries.length + " failure(s) from this step.");
+            }
+
+        } catch (IOException e) {
+            System.err.println("  ERROR accumulating failures: " + e.getMessage());
+        }
+    }
+
+    /**
+     * Reads a file and converts classpath: references to file paths.
+     */
+    private static String buildFeaturesArgFromFile(String filePath) {
+        try {
+            Path path = Paths.get(filePath);
+            if (!Files.exists(path)) return null;
+
+            String content = Files.readString(path).trim();
             if (content.isEmpty()) return null;
 
             // Replace classpath: prefix with actual source path
             content = content.replace("classpath:", "src/test/resources/");
+            // Join multiple lines with space for cucumber.features property
+            content = content.replaceAll("[\\r\\n]+", " ").trim();
             return content;
         } catch (IOException e) {
-            System.err.println("  ERROR reading rerun file: " + e.getMessage());
+            System.err.println("  ERROR reading file: " + e.getMessage());
             return null;
         }
     }
 
     /**
-     * Checks if the rerun file exists and has content.
+     * Checks if a file exists and has content.
      */
-    private static boolean isRerunFilePopulated() {
+    private static boolean isFilePopulated(String filePath) {
         try {
-            Path rerunPath = Paths.get(RERUN_FILE);
-            if (Files.exists(rerunPath)) {
-                String content = Files.readString(rerunPath).trim();
+            Path path = Paths.get(filePath);
+            if (Files.exists(path)) {
+                String content = Files.readString(path).trim();
                 return !content.isEmpty();
             }
         } catch (IOException e) {
-            System.err.println("  ERROR reading rerun file: " + e.getMessage());
+            System.err.println("  ERROR reading file: " + e.getMessage());
         }
         return false;
     }
 
     /**
-     * Reads the entries from the rerun file.
+     * Reads the entries from a file.
      */
-    private static List<String> readRerunFileEntries() {
+    private static List<String> readFileEntries(String filePath) {
         try {
-            Path rerunPath = Paths.get(RERUN_FILE);
-            if (Files.exists(rerunPath)) {
-                List<String> lines = Files.readAllLines(rerunPath);
+            Path path = Paths.get(filePath);
+            if (Files.exists(path)) {
+                List<String> lines = Files.readAllLines(path);
                 lines.removeIf(String::isBlank);
                 return lines;
             }
         } catch (IOException e) {
-            System.err.println("  ERROR reading rerun file: " + e.getMessage());
+            System.err.println("  ERROR reading file: " + e.getMessage());
         }
         return List.of();
+    }
+
+    /**
+     * Clears a file (or creates it empty) to start fresh.
+     */
+    private static void clearFile(String filePath) {
+        try {
+            Files.writeString(Paths.get(filePath), "", 
+                    StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
+        } catch (IOException e) {
+            // Ignore - file may not exist yet
+        }
     }
 
     /**
@@ -203,9 +271,9 @@ public class MasterTestRunner {
     private static void sendExecutionEmail() {
         List<String> failedNames = FailedScenarioTracker.readFailedScenarioNames();
 
-        // Read rerun file to count failures
-        List<String> rerunEntries = readRerunFileEntries();
-        int failed = rerunEntries.size();
+        // Read accumulated failures file to count failures
+        List<String> allFailures = readFileEntries(ALL_FAILURES_FILE);
+        int failed = allFailures.size();
 
         // We don't have exact total/passed/skipped from the child JVM,
         // so read from the failed-scenario-names file for the email
